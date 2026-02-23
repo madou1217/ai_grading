@@ -68,11 +68,62 @@ GRADE_TIMEOUT = int(os.getenv("GRADE_TIMEOUT", "60"))
 # SymPy 层
 # ─────────────────────────────────────────────
 
+
+# Unicode 上标/下标 数字映射
+_SUPER_DIGITS = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")
+_SUB_DIGITS = str.maketrans("₀₁₂₃₄₅₆₇₈₉", "0123456789")
+# 常见 Unicode 分数字符
+_UNICODE_FRACS = {
+    "½": "(1/2)", "⅓": "(1/3)", "⅔": "(2/3)",
+    "¼": "(1/4)", "¾": "(3/4)",
+    "⅕": "(1/5)", "⅖": "(2/5)", "⅗": "(3/5)", "⅘": "(4/5)",
+    "⅙": "(1/6)", "⅚": "(5/6)", "⅛": "(1/8)", "⅜": "(3/8)", "⅝": "(5/8)", "⅞": "(7/8)",
+}
+
+
+def _normalize_mixed_fraction(text: str) -> str:
+    """
+    将带分数的各种写法统一为 SymPy 可解析的 (整数+分数) 形式。
+    支持：
+      - "又" 格式：  18又3/4  → (18+3/4)
+      - Unicode 上下标：18³⁄₄   → (18+3/4)
+      - 单独 Unicode 分数：¾     → (3/4)
+    """
+    # 1) 单独的 Unicode 分数字符（如 ½ ¾）
+    for uc, repl in _UNICODE_FRACS.items():
+        text = text.replace(uc, repl)
+
+    # 2) "又"格式：  18又3/4  →  (18+3/4)
+    text = re.sub(
+        r'(\d+)\s*又\s*(\d+)\s*/\s*(\d+)',
+        lambda m: f"({m.group(1)}+{m.group(2)}/{m.group(3)})",
+        text,
+    )
+
+    # 3) Unicode 上标⁄下标格式：18³⁄₄ → (18+3/4)
+    #    ⁄ = U+2044 (fraction slash)
+    text = re.sub(
+        r'(\d+)\s*([⁰¹²³⁴⁵⁶⁷⁸⁹]+)\s*[⁄/]\s*([₀₁₂₃₄₅₆₇₈₉]+)',
+        lambda m: f"({m.group(1)}+{m.group(2).translate(_SUPER_DIGITS)}/{m.group(3).translate(_SUB_DIGITS)})",
+        text,
+    )
+
+    # 4) 无整数的上标⁄下标：³⁄₄ → (3/4)
+    text = re.sub(
+        r'([⁰¹²³⁴⁵⁶⁷⁸⁹]+)\s*[⁄/]\s*([₀₁₂₃₄₅₆₇₈₉]+)',
+        lambda m: f"({m.group(1).translate(_SUPER_DIGITS)}/{m.group(2).translate(_SUB_DIGITS)})",
+        text,
+    )
+
+    return text
+
+
 def safe_parse(expr_str: str):
     if not expr_str or expr_str.strip() == "":
         return None
+    cleaned = _normalize_mixed_fraction(expr_str)
     cleaned = (
-        expr_str.strip()
+        cleaned.strip()
         .replace("×", "*").replace("÷", "/")
         .replace("²", "**2").replace("³", "**3")
         .replace("√", "sqrt").replace("π", "pi").replace("∞", "oo")

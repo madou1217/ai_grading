@@ -15,6 +15,7 @@ import os
 import json
 import base64
 import io
+import re
 import sys
 import random
 from pathlib import Path
@@ -47,15 +48,22 @@ EXTRACT_PROMPT = """分析数学试卷图片，提取题目和学生作答。
 1. 识别题号、题目内容、手写答案。answer_area_type：计算/填空/选择/判断
 2. 空答案填"未作答"。公式用基础符号（x^2, m/2）
 3. 分数要仔细辨认分子分母，如 1/m 不要写成 1/2m。不确定的字符加[?]
-4. question_bbox/answer_bbox：区域边界框[左%,上%,右%,下%]（占图片宽高的百分比0~100）
+4. **带分数**：整数部分和分数部分之间用"又"连接。例如 18³⁄₄ 写作 "18又3/4"，1⁷⁄₈ 写作 "1又7/8"。绝对不要把整数和分数合并写成 "183/4" 或 "17/8"
+5. **严格区分题目与答题区**：
+   - 试卷上题目文字通常在左侧/上方，答题区（横线/空白/填空框）在右侧/下方
+   - 答题区的内容属于 student_answer，绝不能混入 question_text
+   - 例如一行中左边是题目"...郊遊徑共分成多少個路段？"，右边是答题框"________個路段"，则：
+     question_text 只包含问题部分，student_answer 填写答题区内容或"未作答"
+   - 如果题号后紧跟横线（如 "7. ________"），那整个横线区域是填空的答案位，不是题目
+6. question_bbox/answer_bbox：区域边界框[左%,上%,右%,下%]（占图片宽高的百分比0~100）
 
 JSON格式输出：
 {
   "questions": [
     {
       "question_id": "第X题",
-      "question_text": "题目原文",
-      "student_answer": "手写答案",
+      "question_text": "题目原文（不含答题区横线）",
+      "student_answer": "手写答案或未作答",
       "answer_area_type": "计算",
       "question_bbox": [10,30,60,38],
       "answer_bbox": [65,30,95,38]
@@ -92,24 +100,42 @@ def mock_extract_from_image(image_path: Path) -> dict:
 
 
 # 图片最大宽度(像素), 超过将自动缩放。
-# 7B 模型建议 1024~1280px，大模型可适当调高
-MAX_IMAGE_WIDTH = int(os.environ.get("OCR_MAX_WIDTH", "1280"))
+# Qwen2.5-VL 要求宽高均为 28 的倍数，默认 1260 = 28×45
+MAX_IMAGE_WIDTH = int(os.environ.get("OCR_MAX_WIDTH", "1260"))
 # API 单次调用超时秒数
 API_TIMEOUT = int(os.environ.get("OCR_TIMEOUT", "120"))
+# GGML 500 重试时依次尝试的宽度列表（全部为 28 的倍数）
+_RETRY_WIDTHS = [1260, 980, 700]
+# 视觉模型要求的对齐倍数（Qwen2.5-VL = 28）
+_ALIGN_MULTIPLE = 28
+
+
+def _align_to(val: int, multiple: int = _ALIGN_MULTIPLE) -> int:
+    """将数值向下对齐到 multiple 的倍数，保证 ≥1。"""
+    aligned = (val // multiple) * multiple
+    return max(aligned, multiple)
 
 
 def resize_and_encode(image_path: Path, max_width: int = MAX_IMAGE_WIDTH) -> str:
     """
-    读取图片，如果宽度超过 max_width 则等比例缩放，
+    读取图片，等比缩放后将宽高对齐到 28 的倍数，
     然后返回 JPEG base64 编码字符串。
-    JPEG 常常比 PNG 小 3~5 倍，显著减少传输量。
+    对齐可防止 Qwen2.5-VL 内部 GGML_ASSERT 崩溃。
     """
     img = Image.open(image_path)
     w, h = img.size
+    # 保证 max_width 本身是 28 的倍数
+    max_width = _align_to(max_width)
     if w > max_width:
         ratio = max_width / w
-        img = img.resize((max_width, int(h * ratio)), Image.LANCZOS)
-        print(f" [{w}x{h}→{img.size[0]}x{img.size[1]}]", end="", flush=True)
+        new_w = max_width
+        new_h = _align_to(int(h * ratio))
+    else:
+        new_w = _align_to(w)
+        new_h = _align_to(h)
+    if (new_w, new_h) != (w, h):
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        print(f" [{w}x{h}→{new_w}x{new_h}]", end="", flush=True)
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="JPEG", quality=85)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
@@ -121,49 +147,92 @@ def encode_image(image_path: Path) -> str:
         return base64.b64encode(f.read()).decode("utf-8")
 
 
+def _is_ggml_error(exc: Exception) -> bool:
+    """检测异常是否为 GGML_ASSERT / 500 类错误（可重试）。"""
+    msg = str(exc).lower()
+    return "ggml_assert" in msg or "500" in msg
+
+
 def extract_from_image(client, model: str, image_path: Path) -> dict:
     """
     调用 VLM 对单张图片进行题目识别。
-    图片会先缩放到 MAX_IMAGE_WIDTH 宽并转为 JPEG，显著减少皮荷和延迟。
-    API 调用超时为 API_TIMEOUT 秒。
+    图片会先缩放并对齐到 28 的倍数，转为 JPEG 以减小传输量。
+    如果遇到 GGML 500 错误，会自动用更小的尺寸重试（最多 3 次）。
     """
-    b64 = resize_and_encode(image_path)  # 自动缩放 + JPEG 压缩
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{b64}",
-                                "detail": "high",
+    last_error = None
+    for attempt, width in enumerate(_RETRY_WIDTHS):
+        if attempt > 0:
+            print(f"\n  ↻ 重试 #{attempt}（缩小到 {width}px）...", end="", flush=True)
+        try:
+            b64 = resize_and_encode(image_path, max_width=width)
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{b64}",
+                                    "detail": "high",
+                                },
                             },
-                        },
-                        {"type": "text", "text": EXTRACT_PROMPT},
-                    ],
-                },
-            ],
-            temperature=0.1,
-            max_tokens=4096,
-            timeout=API_TIMEOUT,  # 防止无限卡死
-        )
-        raw = response.choices[0].message.content.strip()
+                            {"type": "text", "text": EXTRACT_PROMPT},
+                        ],
+                    },
+                ],
+                temperature=0.1,
+                max_tokens=4096,
+                timeout=API_TIMEOUT,
+            )
+            raw = response.choices[0].message.content.strip()
 
-        # 多阶段 JSON 提取
-        result = _parse_ocr_json(raw)
-        if result is not None:
-            return result
+            # 多阶段 JSON 提取
+            result = _parse_ocr_json(raw)
+            if result is not None:
+                return result
 
-        print(f"\n[WARN] JSON 解析失败 ({image_path.name})")
-        return {"questions": [], "page_notes": "JSON 解析失败，需人工复核"}
+            print(f"\n[WARN] JSON 解析失败 ({image_path.name})")
+            return {"questions": [], "page_notes": "JSON 解析失败，需人工复核"}
 
-    except Exception as e:
-        print(f"\n[ERROR] 模型调用失败 ({image_path.name}): {e}")
-        return {"questions": [], "page_notes": f"模型错误: {str(e)[:120]}"}
+        except Exception as e:
+            last_error = e
+            if _is_ggml_error(e) and attempt < len(_RETRY_WIDTHS) - 1:
+                print(f"\n[WARN] GGML/500 错误，准备缩小图片重试...", end="", flush=True)
+                continue  # 尝试下一个更小的尺寸
+            # 非 GGML 错误 或 已用完所有重试
+            break
+
+    # 所有重试均失败
+    print(f"\n[ERROR] 模型调用失败 ({image_path.name}): {last_error}")
+    return {"questions": [], "page_notes": f"模型错误（已重试{len(_RETRY_WIDTHS)}次）: {str(last_error)[:120]}"}
+
+
+# 答题区横线模式：匹配 "数字. ___单位(最多4字)" 或末尾的 "___单位"
+# 限制单位后缀最多4个字符，防止误删题目正文
+_BLANK_PATTERN = re.compile(
+    r'\s*\d+\.\s*[_—–\-]{2,}\s*[\u4e00-\u9fff]{0,4}\s*'
+    r'|\s*[_—–\-]{3,}\s*[\u4e00-\u9fff]{0,4}\s*(?=[\s，。？]|$)',
+    re.MULTILINE,
+)
+
+
+def _postprocess_questions(data: dict) -> dict:
+    """
+    OCR 后处理：将泄漏到 question_text 中的答题区横线剥离。
+    如果 student_answer 为'未作答'且剥离出了单位文字，标注到 page_notes。
+    """
+    for page in data.get("pages", [data]):  # 兼容单页和多页
+        for q in page.get("questions", []):
+            qt = q.get("question_text", "")
+            match = _BLANK_PATTERN.search(qt)
+            if match:
+                stripped = match.group().strip()
+                # 从 question_text 中移除答题区残留
+                q["question_text"] = _BLANK_PATTERN.sub("", qt).strip()
+    return data
 
 
 def _parse_ocr_json(raw: str) -> dict | None:
@@ -172,7 +241,7 @@ def _parse_ocr_json(raw: str) -> dict | None:
 
     # 1. 直接解析
     try:
-        return json.loads(raw)
+        return _postprocess_questions(json.loads(raw))
     except (json.JSONDecodeError, ValueError):
         pass
 
@@ -186,7 +255,7 @@ def _parse_ocr_json(raw: str) -> dict | None:
                 c = c[4:].strip()
             if c.startswith("{"):
                 try:
-                    return json.loads(c)
+                    return _postprocess_questions(json.loads(c))
                 except (json.JSONDecodeError, ValueError):
                     cleaned = c
                     break
@@ -195,7 +264,7 @@ def _parse_ocr_json(raw: str) -> dict | None:
     match = _re.search(r'\{[\s\S]*\}', cleaned)
     if match:
         try:
-            return json.loads(match.group())
+            return _postprocess_questions(json.loads(match.group()))
         except (json.JSONDecodeError, ValueError):
             pass
 
